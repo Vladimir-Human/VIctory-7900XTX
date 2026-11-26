@@ -559,11 +559,17 @@ fn sweep() {
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
+    let policy = crate::ram_trim::TrimPolicy::cached();
     crate::pool::room(host().and_then(|h| h.video_memory()));
+    crate::pool::trim_idle_with(&policy, now);
     crate::pipeline::trim_library();
-    crate::shadow::let_go_idle();
-    crate::texture::let_go_idle();
+    crate::pipeline::trim_shaders_with(&policy, now);
+    crate::shadow::let_go_idle_with(&policy, now);
+    crate::texture::let_go_idle_with(&policy, now);
     crate::resource::let_go_idle();
+    crate::list::let_go_idle_with(&policy, now);
+    trim_spare_with(&policy, now);
+    trim_card_work_with(&policy, now);
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -1991,10 +1997,14 @@ fn scratch_pool() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_POOL").is_none_or(|v| v != "0"))
 }
 
+/// Collected D3D12 COM buffers removed from idle lists so they drop outside locks.
+#[derive(Default)]
+pub(crate) struct TrimmedListCaches(Vec<ID3D12Resource>);
+
 /// Things of some sizes that nothing holds now, kept for whoever next asks
-/// for one of the same size.
+/// for one of the same size (carrying their recycle timestamp in ms).
 struct Spare<T> {
-    kept: Vec<(T, u64)>,
+    kept: Vec<(T, u64, u64)>,
     bytes: u64,
 }
 
@@ -2005,20 +2015,60 @@ impl<T> Spare<T> {
 
     /// A kept thing of `size` bytes, the one given last.
     fn take(&mut self, size: u64) -> Option<T> {
-        let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
+        let at = self.kept.iter().rposition(|(_, s, _)| *s == size)?;
         self.bytes -= size;
         Some(self.kept.remove(at).0)
     }
 
     /// Keeps `thing` (`size` bytes) unless that takes the kept bytes past
     /// `most`: then it comes back.
-    fn give(&mut self, thing: T, size: u64, most: u64) -> Option<T> {
+    fn give(&mut self, thing: T, size: u64, most: u64, now: u64) -> Option<T> {
         if self.bytes + size > most {
             return Some(thing);
         }
         self.bytes += size;
-        self.kept.push((thing, size));
+        self.kept.push((thing, size, now));
         None
+    }
+
+    /// Evicts oldest-first items that sat idle past `idle_ms` (or all when
+    /// `force`) until remaining kept bytes fit within `warm_bytes`.
+    fn trim(&mut self, warm_bytes: u64, idle_ms: u64, now: u64, force: bool) -> Vec<(T, u64)> {
+        let target = if force { 0 } else { warm_bytes };
+        if self.bytes <= target || self.kept.is_empty() {
+            return Vec::new();
+        }
+        let mut old = Vec::with_capacity(self.kept.len());
+        let mut out = Vec::new();
+        let all = std::mem::take(&mut self.kept);
+        self.bytes = 0;
+        // Partition while walking oldest-first so LIFO order for kept items stays intact.
+        for item in all {
+            let age = now.saturating_sub(item.2);
+            if force || age >= idle_ms {
+                old.push(item);
+            } else {
+                self.bytes += item.1;
+                self.kept.push(item);
+            }
+        }
+        let mut keep_old = Vec::new();
+        let total_after_fresh = self.bytes + old.iter().map(|i| i.1).sum::<u64>();
+        let mut cur = total_after_fresh;
+        for (thing, size, recycled_ms) in old {
+            if cur > target {
+                cur -= size;
+                out.push((thing, size));
+            } else {
+                self.bytes += size;
+                keep_old.push((thing, size, recycled_ms));
+            }
+        }
+        if !keep_old.is_empty() {
+            keep_old.extend(std::mem::take(&mut self.kept));
+            self.kept = keep_old;
+        }
+        out
     }
 }
 
@@ -2052,13 +2102,14 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
         return;
     }
+    let now = now_ms();
     let mut freed = Vec::new();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
                 let limit = if keep_freed() && !crate::residency::limited_host_ram() { SPARE_KEPT } else { SPARE_MOST };
-                spare.give(chunk, size, limit)
+                spare.give(chunk, size, limit, now)
             } else {
                 Some(chunk)
             };
@@ -2082,7 +2133,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
 /// Lets go of the scratch chunks kept idle, when the system is short of
 /// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]).
 fn trim_spare_chunks() {
-    let freed: Vec<(Chunk, u64)> = {
+    let freed: Vec<(Chunk, u64, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
             return;
@@ -2091,12 +2142,42 @@ fn trim_spare_chunks() {
         std::mem::take(&mut spare.kept)
     };
     let count = freed.len() as u64;
-    let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
+    let bytes: u64 = freed.iter().map(|(_, s, _)| *s).sum();
     ALIVE[1].fetch_sub(count, Ordering::Relaxed);
     ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
     ALIVE[3].fetch_sub(count, Ordering::Relaxed);
     ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
     drop(freed);
+    crate::ram_trim::note_pool_trimmed(bytes);
+}
+
+/// Releases cold scratch upload chunks from [`SPARE`] above the host's
+/// [`TrimPolicy`](crate::ram_trim::TrimPolicy) warm byte ceiling.
+fn trim_spare_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    let freed = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.trim(
+            policy.scratch_spare_warm_bytes,
+            policy.pool_idle_ms,
+            now,
+            policy.panic_memory,
+        )
+    };
+    if freed.is_empty() {
+        return;
+    }
+    let mut bytes = 0u64;
+    let count = freed.len() as u64;
+    for (_, size) in &freed {
+        bytes += *size;
+    }
+    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    // Drop COM buffers outside `SPARE`'s lock.
+    drop(freed);
+    crate::ram_trim::note_pool_trimmed(bytes);
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -2119,6 +2200,8 @@ struct CardWork {
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
+    /// Timestamp (`now_ms`) when `fetched` was last touched by `card_back`.
+    fetched_ms: u64,
     /// The dwords of `differs` taken by plans whose results were not read
     /// yet.
     taken: u32,
@@ -2131,6 +2214,28 @@ struct CardWork {
 unsafe impl Send for CardWork {}
 
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
+
+/// Drops an oversized idle `CardWork::fetched` shared staging buffer once no GPU
+/// flights are pending (`!behind` inside `sweep`) and it exceeds the active
+/// `TrimPolicy::fetched_warm_bytes` threshold beyond `pool_idle_ms`.
+fn trim_card_work_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    let mut dropped: Option<(ID3D12Resource, usize, u64)> = None;
+    {
+        let mut guard = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(work) = guard.as_mut()
+            && work.out == 0
+            && work.taken == 0
+            && let Some((_, _, size)) = work.fetched
+            && size > policy.fetched_warm_bytes
+            && (policy.panic_memory || now.saturating_sub(work.fetched_ms) >= policy.pool_idle_ms)
+        {
+            dropped = work.fetched.take();
+        }
+    }
+    if let Some((_, _, size)) = dropped {
+        crate::ram_trim::note_pool_trimmed(size);
+    }
+}
 
 /// The compare of a declared range of a copy in the card's memory with
 /// its bytes from before, one group per 64 KiB piece (cut at multiples of
@@ -4389,6 +4494,7 @@ impl Host {
                 pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
+                fetched_ms: 0,
                 taken: 0,
                 out: 0,
             })
@@ -5222,6 +5328,7 @@ impl Host {
                 let size = total.next_multiple_of(16 << 20);
                 work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
             }
+            work.fetched_ms = now_ms();
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
             };
@@ -6542,13 +6649,31 @@ impl HostList {
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            states.clear();
+            if states.capacity() > 256 {
+                states.shrink_to(128);
+            }
+        }
+        {
+            let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            twins.clear();
+            if twins.capacity() > 256 {
+                twins.shrink_to(128);
+            }
+        }
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            notes.clear();
+            if notes.capacity() > 1024 {
+                notes.shrink_to(256);
+            }
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -6569,6 +6694,32 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// Collects oversized idle indirect/batch COM buffers held on an idle list into
+    /// `out` so callers can drop D3D12 COM references outside `HostList` and `list::IDLE` locks.
+    pub(crate) fn take_idle_caches(&self, out: &mut TrimmedListCaches) -> u64 {
+        let mut freed_bytes = 0u64;
+        {
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            let cap = slot.as_ref().map_or(0, |(_, cap)| *cap);
+            if cap >= (1 << 20)
+                && let Some((res, _)) = slot.take()
+            {
+                freed_bytes += cap;
+                out.0.push(res);
+            }
+        }
+        {
+            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+            if args.1 == 0 && args.0.len() > 1 {
+                let each = u64::from(BATCHES * crate::indirect::batch::JOBS * crate::indirect::batch::SLOT);
+                freed_bytes += ((args.0.len() - 1) as u64) * each;
+                out.0.extend(args.0.drain(1..));
+                args.0.shrink_to(1);
+            }
+        }
+        freed_bytes
     }
 
     /// Something changed in this list that bringing a draw's textures and
@@ -10464,18 +10615,40 @@ mod spare {
     fn kept_things_come_back_by_size_within_the_limit() {
         let mut spare: Spare<u32> = Spare::new();
         assert_eq!(spare.take(4), None);
-        assert_eq!(spare.give(1, 4, 10), None);
-        assert_eq!(spare.give(2, 1, 10), None);
-        assert_eq!(spare.give(3, 4, 10), None);
+        assert_eq!(spare.give(1, 4, 10, 100), None);
+        assert_eq!(spare.give(2, 1, 10, 200), None);
+        assert_eq!(spare.give(3, 4, 10, 300), None);
         assert_eq!(spare.bytes, 9);
         // Past the limit: handed back, nothing changes.
-        assert_eq!(spare.give(4, 4, 10), Some(4));
+        assert_eq!(spare.give(4, 4, 10, 400), Some(4));
         assert_eq!(spare.bytes, 9);
         assert_eq!(spare.take(2), None, "no thing of that size");
         assert_eq!(spare.take(4), Some(3));
         assert_eq!(spare.take(4), Some(1));
         assert_eq!(spare.take(4), None);
         assert_eq!(spare.take(1), Some(2));
+        assert_eq!(spare.bytes, 0);
+        assert!(spare.kept.is_empty());
+    }
+
+    #[test]
+    fn trim_releases_only_cold_items_past_warm_ceiling() {
+        let mut spare: Spare<u32> = Spare::new();
+        assert_eq!(spare.give(1, 4, 100, 1_000), None);
+        assert_eq!(spare.give(2, 4, 100, 2_000), None);
+        assert_eq!(spare.give(3, 4, 100, 15_000), None);
+        assert_eq!(spare.bytes, 12);
+
+        // Warm target = 4 bytes, idle = 10s, now = 20s: `1` and `2` are cold (>= 10s idle),
+        // `3` is still warm (5s idle) -> evicts `1` and `2`, retains `3`.
+        let evicted = spare.trim(4, 10_000, 20_000, false);
+        assert_eq!(evicted, [(1, 4), (2, 4)]);
+        assert_eq!(spare.bytes, 4);
+        assert_eq!(spare.kept.len(), 1);
+
+        // Forced panic trim clears everything including warm entries.
+        let forced = spare.trim(4, 10_000, 20_000, true);
+        assert_eq!(forced, [(3, 4)]);
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
     }

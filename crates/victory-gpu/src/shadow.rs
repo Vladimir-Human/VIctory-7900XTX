@@ -61,7 +61,11 @@ pub(crate) struct Shadow {
     /// shaders write (`pending`), each at its offset in the copy: what the
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
     /// are set (and read).
-    before: Mutex<Option<Vec<u8>>>,
+    before: Mutex<Option<crate::ram_trim::SnapshotBuffer>>,
+    /// Timestamp (`host::now_ms`) when `before` was last filled/settled.
+    before_ms: AtomicU64,
+    /// True while a submission holds active GPU writes on this shadow before `copy_back_done`.
+    snap_pending: std::sync::atomic::AtomicBool,
     /// Held shared while pieces of the copy are landed (`crate::land`), each
     /// its own bytes of it on several threads, and alone while title bytes
     /// go in under shader writes ([`Shadow::merge_under_writes`]), which
@@ -1258,64 +1262,136 @@ mod relay_tests {
     }
 }
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// Snapshot memory kept for reuse: [`SnapshotBuffer`] plus the timestamp
+/// (`host::now_ms`) when it returned so idle buffers can be `MEM_DECOMMIT`ted
+/// while preserving their `MEM_RESERVE` virtual address reservation.
+struct PooledSnapshot {
+    buf: crate::ram_trim::SnapshotBuffer,
+    recycled_ms: u64,
+}
+
+static POOL: Mutex<Vec<PooledSnapshot>> = Mutex::new(Vec::new());
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one
-/// of about that size: a small copy's snapshot took the 174 MB buffer kept
-/// for the big heap's, which then got another, until eight of them were
-/// reserved (1.4 GB in run 24).
-fn pooled(n: usize) -> Vec<u8> {
+/// of about that size (re-committing its `MEM_RESERVE` pages cleanly if
+/// previously decommitted).
+fn pooled(n: usize) -> crate::ram_trim::SnapshotBuffer {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
         .iter()
         .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
+        .filter(|(_, entry)| entry.buf.capacity() >= n && entry.buf.capacity() <= most)
+        .min_by_key(|(_, entry)| entry.buf.capacity())
         .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
-}
-
-/// How many snapshot buffers are kept (`VICTORY_SNAPSHOT_POOL`; `8`: as
-/// before).
-///
-/// A frame gives some 330 ranges of copies in the PC's memory to shaders, and
-/// most are of copies of their own; with two or three frames in the air eight
-/// buffers were the eight largest, and every other snapshot was memory fresh
-/// from the kernel and given back to it: 11 % of the submitting thread in the
-/// opening (profile cpu-1: `NtAllocateVirtualMemory` under
-/// [`Shadow::writing`]), and the page faults of filling it.
-fn snapshots_kept() -> usize {
-    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024))
-}
-
-/// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
-/// the largest, and of those the largest one and the next ones up to `KEPT`
-/// bytes in all.
-fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let (mut kept, mut total) = (0, 0usize);
-    for v in pool.iter().take(snapshots_kept()) {
-        total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
-            break;
+    if let Some(i) = fit {
+        let mut entry = pool.swap_remove(i);
+        drop(pool);
+        if entry.buf.prepare_for_overwrite(n) {
+            return entry.buf;
         }
-        kept += 1;
+    } else {
+        drop(pool);
     }
-    // (Given back to the kernel without the lock: milliseconds.)
-    let gone = pool.split_off(kept);
-    drop(pool);
-    drop(gone);
+    crate::ram_trim::SnapshotBuffer::new_zeroed(n)
+}
+
+/// Optional explicit limit on how many snapshot buffers are kept
+/// (`VICTORY_SNAPSHOT_POOL`, cached once per process).
+fn snapshots_kept_override() -> Option<usize> {
+    static MOST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// Returns a snapshot buffer to the pool: keeps hot committed capacity bounded
+/// by `warm_limit`, `MEM_DECOMMIT`s overflow slots kept in `MEM_RESERVE` up to
+/// `reserve_slots`, and drops excess slots outside the pool lock.
+fn give_back(v: crate::ram_trim::SnapshotBuffer) {
+    const KEPT: usize = 512 << 20;
+    let policy = crate::ram_trim::TrimPolicy::cached();
+    give_back_with(v, &policy, KEPT);
+}
+
+fn give_back_with(v: crate::ram_trim::SnapshotBuffer, policy: &crate::ram_trim::TrimPolicy, kept_cap: usize) {
+    let now = crate::host::now_ms();
+    let warm_limit = kept_cap.min(policy.shadow_pool_warm_bytes as usize);
+    let commit_cap = if policy.panic_memory { 0 } else { warm_limit };
+    let reserve_slots = if policy.panic_memory {
+        0
+    } else {
+        snapshots_kept_override().unwrap_or_else(|| policy.shadow_pool_reserve_slots.max(8))
+    };
+    let mut dropped = Vec::new();
+    {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.push(PooledSnapshot { buf: v, recycled_ms: now });
+        pool.sort_by_key(|e| std::cmp::Reverse(e.buf.capacity()));
+        if pool.len() > reserve_slots {
+            dropped.extend(pool.drain(reserve_slots..));
+        }
+        let mut committed_total = 0usize;
+        for (idx, entry) in pool.iter_mut().enumerate() {
+            let committed = entry.buf.committed_bytes();
+            if idx >= 8 || commit_cap == 0 || committed_total.saturating_add(committed) > commit_cap {
+                entry.buf.decommit_all();
+            } else {
+                committed_total = committed_total.saturating_add(committed);
+            }
+        }
+    }
+    drop(dropped);
+}
+
+/// Immediately releases all idle committed bytes in [`POOL`] under commit pressure.
+fn trim_pool_panic() {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    for entry in pool.iter_mut() {
+        entry.buf.decommit_all();
+    }
+}
+
+/// Ensures `[from, to)` is committed on `buf`, retrying once after emergency
+/// snapshot pool decommit under OS commit pressure.
+fn ensure_commit(buf: &mut crate::ram_trim::SnapshotBuffer, from: usize, to: usize) -> bool {
+    if buf.ensure_range_committed(from, to) {
+        return true;
+    }
+    trim_pool_panic();
+    buf.ensure_range_committed(from, to)
+}
+
+fn trim_pool_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    let warm_limit = if policy.panic_memory { 0usize } else { policy.shadow_pool_warm_bytes as usize };
+    let mut dropped: Vec<PooledSnapshot> = Vec::new();
+    {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        // Sort newest-first so hot buffers keep committed pages while older
+        // idle buffers are decommitted first.
+        pool.sort_by_key(|e| std::cmp::Reverse(e.recycled_ms));
+        let mut kept_committed = 0usize;
+        for entry in pool.iter_mut() {
+            let age = now.saturating_sub(entry.recycled_ms);
+            let committed = entry.buf.committed_bytes();
+            let hot = !policy.panic_memory
+                && age < policy.pool_idle_ms
+                && kept_committed.saturating_add(committed) <= warm_limit;
+            if hot {
+                kept_committed += committed;
+            } else {
+                entry.buf.decommit_all();
+            }
+        }
+        let max_reserve = if policy.panic_memory {
+            0
+        } else {
+            snapshots_kept_override().unwrap_or(policy.shadow_pool_reserve_slots)
+        };
+        if pool.len() > max_reserve {
+            // Drain oldest decommitted entries from the tail.
+            dropped.extend(pool.drain(max_reserve..));
+        }
+    }
+    drop(dropped);
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -1670,9 +1746,15 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
-            match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
-                None => (0, 0, 0, 0, 0),
+            let mut guard = shadow.before.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(before) = guard.as_mut()
+                && from < to
+                && ensure_commit(before, from, to)
+            {
+                // SAFETY: `[from, to)` was just ensured committed inside `before`.
+                (shadow.data as usize, unsafe { before.raw_ptr() } as usize, shadow.start as usize, from, to)
+            } else {
+                (0, 0, 0, 0, 0)
             }
         })
         .collect();
@@ -2989,12 +3071,20 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 ///
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
+#[allow(dead_code)]
 pub(crate) fn let_go_idle() {
+    let_go_idle_with(&crate::ram_trim::TrimPolicy::cached(), crate::host::now_ms());
+}
+
+pub(crate) fn let_go_idle_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
     const IDLE_FRAMES: u64 = 4;
     let budget = window_budget();
-    let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram()).min(policy.pool_idle_ms);
     let mut keep = u64::MAX;
-    if let Some(bytes) = budget
+    if policy.panic_memory {
+        idle_ms = 0;
+        keep = 0;
+    } else if let Some(bytes) = budget
         && let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample()
     {
         let mut band = WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner());
@@ -3016,30 +3106,34 @@ pub(crate) fn let_go_idle() {
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
-            return;
-        }
-        let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(&key, s)| {
-                (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len)
-            })
-            .collect();
-        eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
-        let victims = if keep == u64::MAX {
-            (0..eligible.len()).collect()
+            Vec::new()
         } else {
-            let entries: Vec<(u64, u64, usize)> = eligible
+            let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
                 .iter()
-                .map(|&(used, _, id, len)| (used, len, id))
+                .filter(|(_, s)| {
+                    Arc::strong_count(s) == 1
+                        && !s.snap_pending.load(Ordering::Acquire)
+                        && (policy.panic_memory
+                            || crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES))
+                        && crate::host::references(&s.buffer) == 1
+                })
+                .map(|(&key, s)| (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len))
                 .collect();
-            window_victims(&entries, keep)
-        };
-        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
+            eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
+            let victims = if keep == u64::MAX {
+                (0..eligible.len()).collect()
+            } else {
+                let entries: Vec<(u64, u64, usize)> = eligible
+                    .iter()
+                    .map(|&(used, _, id, len)| (used, len, id))
+                    .collect();
+                window_victims(&entries, keep)
+            };
+            victims
+                .into_iter()
+                .filter_map(|i| map.remove(&eligible[i].1))
+                .collect()
+        }
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3054,6 +3148,81 @@ pub(crate) fn let_go_idle() {
         // submission is running after all.
         crate::host::retire(shadow);
     }
+    CARDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|w| w.strong_count() > 0);
+    trim_pool_with(policy, now);
+    if let Some(cold_ms) = policy.decommit_cold_reference_ms {
+        trim_cold_references_at(cold_ms, policy.panic_memory, now);
+    }
+}
+
+#[cfg(test)]
+fn trim_cold_references(cold_ms: u64, force: bool) {
+    trim_cold_references_at(cold_ms, force, crate::host::now_ms());
+}
+
+fn trim_cold_references_at(cold_ms: u64, force: bool, now: u64) {
+    let mut live: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let map = buffers_read();
+        live.extend(map.values().filter_map(|e| e.shadow.clone()));
+    }
+    {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        live.extend(map.values().cloned());
+    }
+    {
+        let map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        live.extend(map.1.values().map(|(s, _)| s.clone()));
+    }
+    let mut give_backs: Vec<crate::ram_trim::SnapshotBuffer> = Vec::new();
+    for s in live {
+        // Lock order `pending -> before -> kept`; check emptiness under `pending`
+        // to close TOCTOU with concurrent `Shadow::writing`.
+        let Ok(pending) = s.pending.try_lock() else {
+            continue;
+        };
+        if !pending.is_empty() || s.snap_pending.load(Ordering::Acquire) {
+            continue;
+        }
+        let Ok(mut before_guard) = s.before.try_lock() else {
+            continue;
+        };
+        let Some(snap) = before_guard.as_mut() else {
+            continue;
+        };
+        let Ok(mut kept) = s.kept.try_lock() else {
+            continue;
+        };
+        if s.card.is_some() {
+            kept.0.clear();
+            if kept.1 {
+                kept.1 = false;
+                KEPT_BYTES.fetch_sub(s.len, Ordering::Relaxed);
+            }
+            if let Some(taken) = before_guard.take() {
+                give_backs.push(taken);
+            }
+            continue;
+        }
+        if snap.is_large() {
+            let _ = snap.decommit_zero_pieces();
+            let idle = now.saturating_sub(s.before_ms.load(Ordering::Relaxed));
+            if force || idle >= cold_ms {
+                kept.0.clear();
+                if kept.1 {
+                    kept.1 = false;
+                    KEPT_BYTES.fetch_sub(s.len, Ordering::Relaxed);
+                }
+                let _ = snap.decommit_all();
+            }
+        }
+    }
+    for taken in give_backs {
+        give_back(taken);
+    }
 }
 
 /// For the memory line: host copies alive and their bytes, of them the
@@ -3062,7 +3231,7 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
@@ -3074,7 +3243,10 @@ pub(crate) fn memory() -> [u64; 6] {
     };
     let (kept, kept_bytes) = {
         let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        (pool.len() as u64, pool.iter().map(|v| v.capacity() as u64).sum::<u64>())
+        (
+            pool.len() as u64,
+            pool.iter().map(|p| p.buf.committed_bytes() as u64).sum::<u64>(),
+        )
     };
     [
         LIVE[0].load(Ordering::Relaxed),
@@ -3191,6 +3363,8 @@ impl Shadow {
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
+            before_ms: AtomicU64::new(0),
+            snap_pending: std::sync::atomic::AtomicBool::new(false),
             merging: RwLock::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
@@ -3294,6 +3468,8 @@ impl Shadow {
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
+        self.snap_pending.store(true, Ordering::Release);
+        self.before_ms.store(crate::host::now_ms(), Ordering::Relaxed);
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
@@ -3318,9 +3494,16 @@ impl Shadow {
                     let (lo, hi) = self.piece(piece);
                     let whole = from <= lo && hi <= to;
                     let (lo, hi) = (lo.max(from), hi.min(to));
-                    // SAFETY: as below; `hi <= total`.
+                    if !ensure_commit(snapshot, lo, hi) {
+                        crate::host::fail(format_args!(
+                            "out of host commit backing snapshot [{lo}..{hi}) of shadow {:#x}+{:#x}",
+                            self.start, self.len
+                        ));
+                    }
+                    // SAFETY: `[lo, hi)` was just ensured committed inside `snapshot`,
+                    // and `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.raw_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
                 }
@@ -3333,17 +3516,32 @@ impl Shadow {
             // declared from here on, so nothing changes its bytes before
             // then. The snapshot's memory stays where it is until the
             // range is done with (`copy_back_done`).
+            for &(from, to) in &parts {
+                if from < to && !ensure_commit(snapshot, from, to) {
+                    crate::host::fail(format_args!(
+                        "out of host commit backing snapshot [{from}..{to}) of shadow {:#x}+{:#x}",
+                        self.start, self.len
+                    ));
+                }
+            }
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
-            let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
+            // SAFETY: `[from, to)` for every pushed part was committed above.
+            let (data, snapshot) = (self.data as usize, unsafe { snapshot.raw_mut_ptr() } as usize);
             snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
             return;
         }
         for (from, to) in parts {
             if from < to {
+                if !ensure_commit(snapshot, from, to) {
+                    crate::host::fail(format_args!(
+                        "out of host commit backing snapshot [{from}..{to}) of shadow {:#x}+{:#x}",
+                        self.start, self.len
+                    ));
+                }
                 // SAFETY: the copy's mapping and the snapshot's allocation
-                // (`pooled`) both hold `total` bytes, and `to <= total`.
+                // (`pooled`) both hold `total` bytes, and `[from, to)` is committed.
                 unsafe {
-                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from);
+                    copy_wide(self.data.add(from), snapshot.raw_mut_ptr().add(from), to - from);
                 }
             }
         }
@@ -3369,17 +3567,26 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
-        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
         self.compared(from, to);
-        if let Some(before) = &*snapshot
+        if let Some(before) = snapshot.as_mut()
             && from < to
         {
+            if !ensure_commit(before, from, to) {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    from,
+                    to,
+                    "snapshot range commit failed during copy_back_with"
+                );
+                return 0;
+            }
             // SAFETY: `writing` set the snapshot's bytes of every declared
-            // range, at the copy's offsets.
-            let before = unsafe { std::slice::from_raw_parts(before.as_ptr().add(from), to - from) };
+            // range, and `[from, to)` was ensured committed above.
+            let before = unsafe { std::slice::from_raw_parts(before.raw_ptr().add(from), to - from) };
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission (on several threads: gigabytes a frame, bound by
             // memory speed), title memory read only where the GPU wrote.
@@ -3484,11 +3691,19 @@ impl Shadow {
             std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
             now.set_len(n);
         }
+        if !ensure_commit(before, at, at + n) {
+            tracing::warn!(
+                start = format_args!("{:#x}", self.start),
+                at,
+                n,
+                "snapshot range commit failed during relay_merge"
+            );
+            return 0;
+        }
         // SAFETY: the snapshot's allocation holds the copy's length
         // (`writing`), and these offsets are in a range declared and not
-        // done with, whose bytes it holds; nothing else touches them
-        // without the lock held here.
-        let held = unsafe { std::slice::from_raw_parts_mut(before.as_mut_ptr().add(at), n) };
+        // done with, whose bytes are committed under the lock.
+        let held = unsafe { std::slice::from_raw_parts_mut(before.raw_mut_ptr().add(at), n) };
         let Some(first) = first_difference(now, held) else {
             return 0;
         };
@@ -3580,7 +3795,26 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
-        if !pending.is_empty() || self.card.is_some() {
+        if !pending.is_empty() {
+            return;
+        }
+        self.snap_pending.store(false, Ordering::Release);
+        self.before_ms.store(crate::host::now_ms(), Ordering::Relaxed);
+        if self.card.is_some() {
+            let taken = {
+                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+                kept.0.clear();
+                if kept.1 {
+                    kept.1 = false;
+                    KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+                }
+                before.take()
+            };
+            drop(pending);
+            if let Some(bytes) = taken {
+                give_back(bytes);
+            }
             return;
         }
         if keeps() {
@@ -3602,7 +3836,9 @@ impl Shadow {
             // the snapshot's.)
             kept.0.clear();
         }
-        if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let taken = self.before.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(pending);
+        if let Some(bytes) = taken {
             give_back(bytes);
         }
     }
@@ -3763,8 +3999,17 @@ impl Shadow {
             let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
             let held = if self.card.is_some() {
                 self.data as usize
+            } else if let Some(snapshot) = before.as_mut() {
+                let rel_from = a.saturating_sub(start);
+                let rel_to = e.saturating_sub(start).min(self.len as usize);
+                if rel_from < rel_to && !ensure_commit(snapshot, rel_from, rel_to) {
+                    0
+                } else {
+                    // SAFETY: `[rel_from, rel_to)` was just ensured committed above.
+                    unsafe { snapshot.raw_mut_ptr() as usize }
+                }
             } else {
-                before.as_mut().map_or(0, |snapshot| snapshot.as_mut_ptr() as usize)
+                0
             };
             if held == 0 {
                 note_stale(3);
@@ -4423,8 +4668,19 @@ impl Shadow {
             // refresh writes; the lock keeps the landing out.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
         } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            // SAFETY: the snapshot's allocation holds the copy's length.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
+            if !ensure_commit(snapshot, from, to) {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    from,
+                    to,
+                    "snapshot range commit failed during placed_copy"
+                );
+                drop(_merging);
+                self.changed(from, to);
+                return;
+            }
+            // SAFETY: the snapshot's allocation holds the copy's length and `[from, to)` is committed.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.raw_mut_ptr().add(from), bytes.len()) };
         }
         self.changed(from, to);
     }
@@ -4476,8 +4732,30 @@ impl Shadow {
         *before = make(card.size);
         if before.is_some() {
             CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
+            drop(before);
+            // Resident-on-card copies track hashes in `card.before` on the GPU;
+            // reclaim any non-pending CPU reference snapshot under `pending -> before -> kept`.
+            let cpu_snap = {
+                let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                if pending.is_empty() && !self.snap_pending.load(Ordering::Acquire) {
+                    let mut before_guard = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+                    kept.0.clear();
+                    if kept.1 {
+                        kept.1 = false;
+                        KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+                    }
+                    before_guard.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(cpu_snap) = cpu_snap {
+                give_back(cpu_snap);
+            }
+            return true;
         }
-        before.is_some()
+        false
     }
 
     /// The declared range `[address, end)` as the compare on the card
@@ -4791,16 +5069,31 @@ impl Shadow {
         crate::land::spent(crate::land::stat::LOCK, waiting);
         // The snapshot's memory stays where it is until the range is done
         // with (`copy_back_done`), which comes after this.
-        let Some(held) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(Vec::as_mut_ptr) else {
-            return 0;
+        let held = {
+            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(snap) = before.as_mut() else {
+                return 0;
+            };
+            if !ensure_commit(snap, at, at + n) {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    at,
+                    n,
+                    "snapshot range commit failed during land_back"
+                );
+                return 0;
+            }
+            // SAFETY: `[at, at + n)` was ensured committed above, and `snap`
+            // remains live until `copy_back_done` after landing returns.
+            unsafe { snap.raw_mut_ptr() }
         };
         // SAFETY: inside the copy's mapping (checked above), which only the
         // card writes there, and inside the snapshot's allocation, which
         // holds the copy's length (`writing`): these offsets are in a range
-        // declared and not done with, whose bytes it holds, and the lock
-        // keeps out what else writes them. Title memory that is not there
-        // is looked at again when the next flight that declared the range
-        // lands.
+        // declared and not done with, whose committed bytes it holds, and
+        // the lock keeps out what else writes them. Title memory that is
+        // not there is looked at again when the next flight that declared
+        // the range lands.
         unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) }
     }
 
@@ -5854,6 +6147,129 @@ mod window_tests {
     }
 }
 
+/// Title memory `[at, at + len)` was unmapped, remapped, or decommitted:
+/// releases idle shadows wholly inside that range and `MEM_DECOMMIT`s any
+/// overlapping dead snapshot pages while keeping `MEM_RESERVE` intact.
+pub(crate) fn title_memory_remapped(at: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    let mut overlap: Vec<Arc<Shadow>> = Vec::new();
+    let can_retire = |s: &Arc<Shadow>| {
+        Arc::strong_count(s) == 1
+            && !s.snap_pending.load(Ordering::Acquire)
+            && crate::host::references(&s.buffer) == 1
+            && s.pending.try_lock().is_ok_and(|p| p.is_empty())
+    };
+
+    {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map
+            .range(..(end, 0))
+            .filter(|(key, _)| key.0 < end && key.0.saturating_add(key.1) > at)
+            .map(|(key, _)| *key)
+            .collect();
+        let mut remove_keys = Vec::new();
+        for key in keys {
+            let Some(s) = map.get(&key) else {
+                continue;
+            };
+            let contained = key.0 >= at && key.0.saturating_add(key.1) <= end;
+            if contained && can_retire(s) {
+                remove_keys.push(key);
+            } else {
+                overlap.push(s.clone());
+            }
+        }
+        for key in remove_keys {
+            if map.get(&key).is_some_and(&can_retire) {
+                gone.extend(map.remove(&key));
+            } else if let Some(s) = map.get(&key) {
+                overlap.push(s.clone());
+            }
+        }
+    }
+
+    {
+        let mut map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map
+            .1
+            .range(..(end, 0))
+            .filter(|(key, _)| key.0 < end && key.0.saturating_add(key.1) > at)
+            .map(|(key, _)| *key)
+            .collect();
+        let mut remove_keys = Vec::new();
+        for key in keys {
+            let Some((s, _)) = map.1.get(&key) else {
+                continue;
+            };
+            let contained = key.0 >= at && key.0.saturating_add(key.1) <= end;
+            if contained && can_retire(s) {
+                remove_keys.push(key);
+            } else {
+                overlap.push(s.clone());
+            }
+        }
+        for key in remove_keys {
+            if map.1.get(&key).is_some_and(|(s, _)| can_retire(s)) {
+                if let Some((s, _used)) = map.1.remove(&key) {
+                    gone.push(s);
+                }
+            } else if let Some((s, _)) = map.1.get(&key) {
+                overlap.push(s.clone());
+            }
+        }
+    }
+
+    {
+        let map = buffers_read();
+        for (_, entry) in map.range(..(end, 0)).rev().take(256) {
+            if entry.end > at
+                && let Some(s) = &entry.shadow
+            {
+                overlap.push(s.clone());
+            }
+        }
+    }
+
+    overlap.sort_by_key(|s| Arc::as_ptr(s) as usize);
+    overlap.dedup_by_key(|s| Arc::as_ptr(s) as usize);
+
+    for s in overlap {
+        let pending = s.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if !pending.is_empty() || s.snap_pending.load(Ordering::Acquire) {
+            continue;
+        }
+        let ov_start = at.max(s.start);
+        let ov_end = end.min(s.start.saturating_add(s.len));
+        if ov_start >= ov_end {
+            continue;
+        }
+        let rel_from = (ov_start - s.start) as usize;
+        let rel_to = (ov_end - s.start) as usize;
+        let mut before_guard = s.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = s.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if !kept.0.is_empty() {
+            let pieces = s.pieces(rel_from, rel_to);
+            let limit = kept.0.len();
+            for piece in pieces.start.min(limit)..pieces.end.min(limit) {
+                kept.0[piece] = false;
+            }
+        }
+        if let Some(snap) = before_guard.as_mut() {
+            let _ = snap.decommit_byte_range(rel_from, rel_to);
+        }
+    }
+
+    for shadow in gone {
+        LET_GO[0].fetch_add(1, Ordering::Relaxed);
+        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
+        crate::host::retire(shadow);
+    }
+}
+
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
@@ -5884,4 +6300,451 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(all(test, windows))]
+mod ram_trim_tests {
+    use super::*;
+    use crate::ram_trim::{HostTier, MIB, SnapshotBuffer, TrimPolicy, VM_PIECE};
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+
+    fn exact_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn pool_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn test_policy(warm_bytes: u64, reserve_slots: usize, idle_ms: u64) -> TrimPolicy {
+        TrimPolicy {
+            aggressive: true,
+            tier: HostTier::Tight16,
+            low_memory: false,
+            panic_memory: false,
+            pool_idle_ms: idle_ms,
+            shadow_pool_warm_bytes: warm_bytes,
+            shadow_pool_reserve_slots: reserve_slots,
+            scratch_spare_warm_bytes: 0,
+            texture_spare_warm_bytes: 0,
+            list_idle_warm_count: 0,
+            list_idle_ms: 0,
+            shader_dxil_idle_ms: 0,
+            shader_container_idle_ms: 0,
+            decommit_cold_reference_ms: Some(idle_ms),
+            fetched_warm_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn pool_decommits_idle_buffers_preserving_va_and_recommits_on_reuse() {
+        let _pool = pool_test_lock();
+        let mut buf = SnapshotBuffer::new_zeroed(16 * MIB);
+        let base_addr = buf.base_addr().expect("expected VmBlock");
+        buf.as_mut_slice().fill(0x55);
+        let warm_policy = test_policy((64 * MIB) as u64, 16, 2_000);
+        give_back_with(buf, &warm_policy, 512 << 20);
+
+        // Trim after idle age expires: keeps MEM_RESERVE slot, decommits all 16 MiB.
+        let policy = test_policy(0, 16, 2_000);
+        trim_pool_with(&policy, crate::host::now_ms().saturating_add(10_000));
+
+        {
+            let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = pool
+                .iter()
+                .find(|e| e.buf.base_addr() == Some(base_addr))
+                .expect("decommitted reservation slot remains in pool");
+            assert_eq!(entry.buf.committed_bytes(), 0);
+        }
+        // SAFETY: plain zeroed `MEMORY_BASIC_INFORMATION`.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_ne!(
+            // SAFETY: querying live `MEM_RESERVE` VA owned by `POOL`.
+            unsafe { VirtualQuery(base_addr as *const _, &mut mbi, size_of_val(&mbi)) },
+            0
+        );
+        assert_eq!(mbi.State, MEM_RESERVE);
+        assert_eq!(mbi.AllocationBase as usize, base_addr);
+
+        // Reuse from pool re-commits cleanly at a reserved slot with zero corruption.
+        let mut reused = pooled(16 * MIB);
+        assert_eq!(reused.base_addr(), Some(base_addr), "MEM_RESERVE base VA must be reused");
+        assert_eq!(reused.committed_bytes(), 16 * MIB);
+        assert!(reused.as_slice().iter().all(|&b| b == 0));
+        reused.as_mut_slice()[0] = 0xAA;
+        reused.as_mut_slice()[16 * MIB - 1] = 0xBB;
+        assert_eq!((reused.as_slice()[0], reused.as_slice()[16 * MIB - 1]), (0xAA, 0xBB));
+    }
+
+    #[test]
+    fn give_back_enforces_warm_limit_zero_and_panic_memory_on_slot_zero() {
+        let _pool = pool_test_lock();
+        let mut buf0 = SnapshotBuffer::new_zeroed(16 * MIB);
+        let addr0 = buf0.base_addr().expect("expected VmBlock");
+        buf0.as_mut_slice().fill(0x11);
+        give_back_with(buf0, &test_policy(0, 16, 2_000), 512 << 20);
+        {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let pos = pool
+                .iter()
+                .position(|e| e.buf.base_addr() == Some(addr0))
+                .expect("slot 0 reserve must remain in pool when reserve_slots >= 8");
+            assert_eq!(pool[pos].buf.committed_bytes(), 0, "warm_limit == 0 must decommit slot 0");
+            pool.remove(pos);
+        }
+
+        let mut buf_oversized = SnapshotBuffer::new_zeroed(16 * MIB);
+        let addr1 = buf_oversized.base_addr().expect("expected VmBlock");
+        buf_oversized.as_mut_slice().fill(0x22);
+        give_back_with(buf_oversized, &test_policy((8 * MIB) as u64, 16, 2_000), 512 << 20);
+        {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let pos = pool
+                .iter()
+                .position(|e| e.buf.base_addr() == Some(addr1))
+                .expect("slot reserve must remain");
+            assert_eq!(pool[pos].buf.committed_bytes(), 0, "slot 0 larger than warm_limit must be decommitted");
+            pool.remove(pos);
+        }
+
+        let mut panic_policy = test_policy((64 * MIB) as u64, 16, 2_000);
+        panic_policy.panic_memory = true;
+        let mut buf_panic = SnapshotBuffer::new_zeroed(16 * MIB);
+        let addr2 = buf_panic.base_addr().expect("expected VmBlock");
+        buf_panic.as_mut_slice().fill(0x33);
+        give_back_with(buf_panic, &panic_policy, 512 << 20);
+        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            pool.iter().all(|e| e.buf.base_addr() != Some(addr2)),
+            "panic_memory must not retain pooled buffers"
+        );
+    }
+
+    #[test]
+    fn title_memory_remapped_decommits_dead_snapshot_pages_and_recommits_on_write() {
+        let _exact = exact_test_lock();
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const LEN: usize = 8 * MIB;
+        let Some((buffer, data)) = host.shared_buffer(LEN as u64) else {
+            return;
+        };
+        // Pick a disjoint synthetic title VA range so parallel tests don't collide.
+        let start = 0x7000_0000_0000u64;
+        let shadow = Arc::new(Shadow::new(buffer, data, 0, start, LEN as u64));
+
+        // Populate `before` snapshot covering the whole 8 MiB buffer as idle reference.
+        let mut snap = SnapshotBuffer::new_zeroed(LEN);
+        snap.as_mut_slice().fill(0x3C);
+        let snap_base = unsafe { snap.raw_ptr() } as usize;
+        *shadow.before.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
+        shadow.snap_pending.store(false, Ordering::Release);
+
+        {
+            let mut map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+            map.0 += 1;
+            let tick = map.0;
+            map.1.insert((start, LEN as u64), (shadow.clone(), tick));
+        }
+
+        // Remap/free the middle 4 MiB `[2 MiB, 6 MiB)` while `Shadow` holds `>1` Arc
+        // (simulating partial remap of a live registered range).
+        title_memory_remapped(start + (2 * MIB) as u64, (4 * MIB) as u64);
+
+        let query_at = |offset: usize| -> u32 {
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            assert_ne!(
+                unsafe { VirtualQuery((snap_base + offset) as *const _, &mut mbi, size_of_val(&mbi)) },
+                0
+            );
+            mbi.State
+        };
+        assert_eq!(query_at(0), MEM_COMMIT, "head before remapped range stays committed");
+        assert_eq!(query_at(2 * MIB), MEM_RESERVE, "remapped middle range must be MEM_DECOMMITted");
+        assert_eq!(query_at(6 * MIB), MEM_COMMIT, "tail after remapped range stays committed");
+
+        // Verify untouched head and tail snapshot bytes are intact, and re-commit works.
+        {
+            let mut guard = shadow.before.lock().unwrap_or_else(|e| e.into_inner());
+            let snap = guard.as_mut().unwrap();
+            assert_eq!(snap.committed_bytes(), 4 * MIB);
+            assert!(snap.ensure_range_committed(2 * MIB, 6 * MIB));
+            assert_eq!(query_at(2 * MIB), MEM_COMMIT);
+            let s = snap.as_slice();
+            assert!(s[..2 * MIB].iter().all(|&b| b == 0x3C));
+            assert!(s[2 * MIB..6 * MIB].iter().all(|&b| b == 0));
+            assert!(s[6 * MIB..].iter().all(|&b| b == 0x3C));
+        }
+
+        // Clean up test entry from `EXACT` without altering monotonic tick `map.0`.
+        let mut map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        map.1.remove(&(start, LEN as u64));
+    }
+
+    #[test]
+    fn title_memory_remapped_preserves_exact_monotonic_tick_and_wide_loose() {
+        let _exact = exact_test_lock();
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const LEN: usize = 8 * MIB;
+        let Some((ex_buf, ex_ptr)) = host.shared_buffer(LEN as u64) else {
+            return;
+        };
+        let exact_start = 0x7300_0000_0000u64;
+        let exact_shadow = Arc::new(Shadow::new(ex_buf, ex_ptr, 0, exact_start, LEN as u64));
+        let tick_before = {
+            let mut map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+            map.0 += 100;
+            let t = map.0;
+            map.1.insert((exact_start, LEN as u64), (exact_shadow, t));
+            t
+        };
+
+        // Also register an 8 MiB (> 4 MiB WINDOW) `LOOSE` entry to ensure
+        // overlaps starting > `WINDOW` below `remap_at` are still found.
+        let Some((loose_buf, loose_ptr)) = host.shared_buffer(LEN as u64) else {
+            return;
+        };
+        let loose_start = 0x7400_0000_0000u64;
+        let loose_shadow = Arc::new(Shadow::new(loose_buf, loose_ptr, 0, loose_start, LEN as u64));
+        let mut loose_snap = SnapshotBuffer::new_zeroed(LEN);
+        loose_snap.as_mut_slice().fill(0x5A);
+        *loose_shadow.before.lock().unwrap_or_else(|e| e.into_inner()) = Some(loose_snap);
+        LOOSE
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((loose_start, LEN as u64), loose_shadow.clone());
+
+        title_memory_remapped(exact_start, LEN as u64);
+        {
+            let map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !map.1.contains_key(&(exact_start, LEN as u64)),
+                "contained single-owner EXACT entry must be removed"
+            );
+            assert_eq!(map.0, tick_before, "EXACT.0 monotonic tick counter must never decrement on removal");
+        }
+
+        // Remap tail `[6 MiB, 8 MiB)` of the 8 MiB LOOSE shadow (6 MiB > WINDOW=4 MiB from start).
+        title_memory_remapped(loose_start + (6 * MIB) as u64, (2 * MIB) as u64);
+        assert_eq!(
+            loose_shadow
+                .before
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .committed_bytes(),
+            6 * MIB,
+            "LOOSE overlap > WINDOW away from entry start must be decommitted"
+        );
+        LOOSE
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(loose_start, LEN as u64));
+    }
+
+    #[test]
+    fn carded_shadow_releases_cpu_before_snapshot() {
+        let _pool = pool_test_lock();
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const LEN: usize = 2 * MIB;
+        let (Some((cpu_buf, cpu_ptr)), Some(card_buf), Some((staging, _))) = (
+            host.shared_buffer(LEN as u64),
+            host.uav_buffer(LEN as u64),
+            host.shared_buffer(LEN as u64),
+        ) else {
+            return;
+        };
+        let mut shadow = Shadow::new(card_buf, cpu_ptr, 0, 0x7100_0000_0000, LEN as u64);
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            touched: std::sync::atomic::AtomicBool::new(false),
+            size: LEN as u64,
+        });
+        CARD_BYTES[0].fetch_add(LEN as u64, Relaxed);
+        drop(cpu_buf);
+        *shadow.before.lock().unwrap_or_else(|e| e.into_inner()) = Some(SnapshotBuffer::new_zeroed(LEN));
+        assert!(shadow.before.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+
+        let made = shadow.card_make_before(|_| host.uav_buffer(card_hash_bytes(LEN as u64)));
+        assert!(made);
+        assert!(
+            shadow.before.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "resident-on-card shadow must release idle CPU before snapshot"
+        );
+        let _ = VM_PIECE;
+    }
+
+    #[test]
+    fn aggressive_cold_reference_trim_decommits_zeros_and_respects_pending() {
+        let _exact = exact_test_lock();
+        let _pool = pool_test_lock();
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const LEN: usize = 4 * MIB;
+        let Some((buffer, data)) = host.shared_buffer(LEN as u64) else {
+            return;
+        };
+        let start = 0x7200_0000_0000u64;
+        let shadow = Arc::new(Shadow::new(buffer, data, 0, start, LEN as u64));
+
+        // 4 MiB snapshot: first 2 MiB all zeros, last 2 MiB non-zero.
+        let mut snap = SnapshotBuffer::new_zeroed(LEN);
+        snap.as_mut_slice()[2 * MIB..].fill(0x7F);
+        *shadow.before.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
+        shadow.before_ms.store(crate::host::now_ms(), Relaxed);
+        // Mark `snap_pending = true`: aggressive sweep MUST NOT touch pending snapshots.
+        shadow.snap_pending.store(true, Ordering::Release);
+
+        {
+            let mut map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+            map.0 += 1;
+            let tick = map.0;
+            map.1.insert((start, LEN as u64), (shadow.clone(), tick));
+        }
+
+        trim_cold_references(1, true);
+        assert_eq!(
+            shadow
+                .before
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .committed_bytes(),
+            LEN,
+            "pending snapshot must never be decommitted mid-flight"
+        );
+
+        // Once settled (`snap_pending = false`), non-forced cold trim decommits the
+        // 2 MiB zero prefix right away while keeping the fresh non-zero tail warm.
+        shadow.snap_pending.store(false, Ordering::Release);
+        shadow.kept.lock().unwrap_or_else(|e| e.into_inner()).0 = vec![true; 64];
+        trim_cold_references(600_000, false);
+        assert_eq!(
+            shadow
+                .before
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .committed_bytes(),
+            2 * MIB,
+            "aggressive mode decommits identical zero backing pages immediately"
+        );
+
+        // Forced/aged cold trim clears `kept` and decommits remaining cold reference pages.
+        trim_cold_references(0, true);
+        assert!(shadow.kept.lock().unwrap_or_else(|e| e.into_inner()).0.is_empty());
+        assert_eq!(
+            shadow
+                .before
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .committed_bytes(),
+            0
+        );
+
+        let mut map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        map.1.remove(&(start, LEN as u64));
+    }
+
+    #[test]
+    fn title_memory_freed_zero_len_reclaims_snapshot_with_higher_guarded_block() {
+        let _exact = exact_test_lock();
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const LEN: usize = 2 * MIB;
+        let Some((buffer, data)) = host.shared_buffer(LEN as u64) else {
+            return;
+        };
+        use windows_sys::Win32::System::Memory::{
+            MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc2, VirtualFree,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        // Allocate `[low, low + LEN)` as an unguarded private allocation and
+        // `[high, high + PAGE)` as a separate higher allocation noted in `watch::GUARDS`.
+        let low = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                LEN + PAGE,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            assert_ne!(VirtualFree(p as *mut _, LEN, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 0);
+            let low = VirtualAlloc2(
+                GetCurrentProcess(),
+                p as *const _,
+                LEN,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_eq!(low, p);
+            low
+        };
+        let high = low + LEN;
+        assert!(crate::watch::writes(high, high + PAGE, true).is_some());
+
+        let shadow = Arc::new(Shadow::new(buffer, data, 0, low as u64, LEN as u64));
+        let mut snap = SnapshotBuffer::new_zeroed(LEN);
+        snap.as_mut_slice().fill(0x5B);
+        *shadow.before.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
+        shadow.snap_pending.store(false, Ordering::Release);
+        {
+            let mut map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+            map.0 += 1;
+            let tick = map.0;
+            map.1.insert((low as u64, LEN as u64), (shadow.clone(), tick));
+        }
+
+        // `len == 0` (`MEM_RELEASE`) must still resolve `[low, low + LEN)` and reclaim
+        // dead snapshot pages even when an unrelated guarded/noted block exists at `high > low`.
+        crate::watch::title_memory_freed(low, 0);
+        assert_eq!(
+            shadow
+                .before
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .committed_bytes(),
+            0,
+            "title_memory_freed(at, 0) must reclaim dead snapshot pages despite higher noted block"
+        );
+
+        {
+            let mut map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+            map.1.remove(&(low as u64, LEN as u64));
+        }
+        crate::watch::title_memory_freed(high, PAGE);
+        // SAFETY: distinct allocations created from placeholders owned by this test.
+        unsafe {
+            assert_ne!(VirtualFree(low as *mut _, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(high as *mut _, 0, MEM_RELEASE), 0);
+        }
+    }
 }

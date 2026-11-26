@@ -3623,7 +3623,8 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
-    open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+    open(&title_memory_changed(at, len), at, at.saturating_add(len));
+    crate::shadow::title_memory_remapped(at as u64, len as u64);
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
@@ -3634,22 +3635,25 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 pub fn title_memory_unmapping(at: usize, len: usize) {
     crate::texback::remapped(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    let mut g = title_memory_changed(at, len);
-    if CHANGING.get().0 && len != 0 {
-        CHANGING.set((true, true));
-        let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-        match g.changing.last_mut() {
-            Some(before) if before.1 == first => before.1 = last,
-            _ => g.changing.push((first, last)),
+    {
+        let mut g = title_memory_changed(at, len);
+        if CHANGING.get().0 && len != 0 {
+            CHANGING.set((true, true));
+            let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+            match g.changing.last_mut() {
+                Some(before) if before.1 == first => before.1 = last,
+                _ => g.changing.push((first, last)),
+            }
+        }
+        let blocks: Vec<usize> = g.protected.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
+        for block in blocks {
+            g.protected.remove(block);
+            g.clean.remove(block);
+            PUBLISHED.clear(block);
+            PROTECTED.clear(block);
         }
     }
-    let blocks: Vec<usize> = g.protected.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
-    for block in blocks {
-        g.protected.remove(block);
-        g.clean.remove(block);
-        PUBLISHED.clear(block);
-        PROTECTED.clear(block);
-    }
+    crate::shadow::title_memory_remapped(at as u64, len as u64);
 }
 
 /// The title is about to free or decommit memory of its own,
@@ -3662,34 +3666,52 @@ pub fn title_memory_freed(at: usize, len: usize) {
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
         forget_views(at / BLOCK, allocation_end(at, at).div_ceil(BLOCK).max(at / BLOCK + 1));
     }
-    let mut g = guards();
-    let first = at / BLOCK;
-    let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
-    let Some(noted) = noted.into_iter().flatten().min() else {
-        return;
-    };
-    let end = if len != 0 {
-        at.saturating_add(len).div_ceil(BLOCK)
-    } else {
-        allocation_end(at, noted * BLOCK).div_ceil(BLOCK)
-    };
-    if noted >= end {
-        return;
-    }
-    let absent: Vec<usize> = g.absent.range(first..end).collect();
-    for block in absent {
-        g.absent.remove(block);
-        if g.held.remove(block) {
-            PUBLISHED.clear(block);
+    let known_len = {
+        let mut g = guards();
+        let first = at / BLOCK;
+        let noted = [
+            g.protected.range(first..).next(),
+            g.absent.range(first..).next(),
+            g.foreign.range(first..).next().copied(),
+        ];
+        if let Some(noted) = noted.into_iter().flatten().min() {
+            let alloc_end = if len != 0 {
+                at.saturating_add(len)
+            } else {
+                allocation_end(at, noted * BLOCK)
+            };
+            let end = alloc_end.div_ceil(BLOCK);
+            if noted < end {
+                let absent: Vec<usize> = g.absent.range(first..end).collect();
+                for block in absent {
+                    g.absent.remove(block);
+                    if g.held.remove(block) {
+                        PUBLISHED.clear(block);
+                    }
+                }
+                let foreign: Vec<usize> = g.foreign.range(first..end).copied().collect();
+                for block in foreign {
+                    g.foreign.remove(&block);
+                }
+                // (Memory that is still a view is not freed by that call, which fails:
+                // it must not stay read-only.)
+                open(&g, at, end * BLOCK);
+            }
+            (len == 0 && alloc_end > at).then(|| alloc_end.saturating_sub(at))
+        } else {
+            None
         }
+    };
+    let clear_len = if len != 0 {
+        len as u64
+    } else if let Some(known) = known_len {
+        known as u64
+    } else {
+        allocation_end(at, at).saturating_sub(at) as u64
+    };
+    if clear_len > 0 {
+        crate::shadow::title_memory_remapped(at as u64, clear_len);
     }
-    let foreign: Vec<usize> = g.foreign.range(first..end).copied().collect();
-    for block in foreign {
-        g.foreign.remove(&block);
-    }
-    // (Memory that is still a view is not freed by that call, which fails:
-    // it must not stay read-only.)
-    open(&g, at, end * BLOCK);
 }
 
 /// The end of the allocation at `at`, if `inside` lies in it; else `at`.

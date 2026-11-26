@@ -53,10 +53,12 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
-    if let Ok(mut pool) = TEXTURES.try_lock() {
-        pool.reclaim(tick, limit, true);
-    }
-    if let Ok(mut pool) = STAGING.try_lock() {
+    let evicted_tex = if let Ok(mut pool) = TEXTURES.try_lock() {
+        pool.reclaim_with(tick, limit, None, true)
+    } else {
+        Vec::new()
+    };
+    let evicted_staging = if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
             0
         } else if pressure {
@@ -64,7 +66,15 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         } else {
             limit
         };
-        pool.reclaim(tick, staging_limit, true);
+        pool.reclaim_with(tick, staging_limit, None, true)
+    } else {
+        Vec::new()
+    };
+    drop(evicted_tex);
+    if !evicted_staging.is_empty() {
+        let bytes = (evicted_staging.len() as u64) * BLOCK;
+        drop(evicted_staging);
+        crate::ram_trim::note_pool_trimmed(bytes);
     }
 }
 
@@ -193,6 +203,8 @@ struct Block<B> {
     /// When that was (ms).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     since: u64,
+    /// Last tick (`now_ms`) a piece was allocated from or returned to this block.
+    last_used_ms: u64,
 }
 
 struct Pool<B> {
@@ -277,6 +289,7 @@ impl<B: Clone> Pool<B> {
         let block = self.blocks[i].as_mut()?;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
+        block.last_used_ms = now;
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
@@ -295,6 +308,10 @@ impl<B: Clone> Pool<B> {
     }
 
     fn add(&mut self, memory: B, made: u64) -> usize {
+        self.add_at(memory, made, crate::host::now_ms())
+    }
+
+    fn add_at(&mut self, memory: B, made: u64, now_ms: u64) -> usize {
         let i = match self.blocks.iter().position(Option::is_none) {
             Some(i) => i,
             None => {
@@ -302,7 +319,14 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block {
+            memory,
+            free: Ranges::new(BLOCK),
+            used_to: 0,
+            made,
+            since: now_ms,
+            last_used_ms: now_ms,
+        });
         i
     }
 
@@ -319,34 +343,96 @@ impl<B: Clone> Pool<B> {
     /// [`Pool::rested`] with at most `limit` empty blocks kept; `sweep`: the
     /// empty blocks are looked at even if no piece came back.
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
+        drop(self.reclaim_with(now, limit, None, sweep));
+    }
+
+    /// Returns evicted empty blocks so callers can drop D3D12 COM objects
+    /// completely outside pool mutexes.
+    fn reclaim_with(&mut self, now: u64, limit: usize, min_idle_ms: Option<u64>, sweep: bool) -> Vec<Block<B>> {
         let mut any = false;
+        let mut evicted = Vec::new();
         while let Some(&(ready, piece)) = self.resting.front()
             && ready <= now
         {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
+                block.last_used_ms = now;
                 any |= block.free.whole(BLOCK);
             }
         }
         // (Without a piece given back too, once there is less room.)
         let most = limit.min(self.most);
-        if sweep || any || most < self.spare {
+        if sweep || any || most < self.spare || min_idle_ms.is_some() {
             self.spare = most;
-            let mut spare = 0;
-            for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
-                    spare += 1;
-                    if spare > most {
-                        *block = None;
+            let mut empty_idx: Vec<(u64, usize)> = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, block)| {
+                    let b = block.as_ref()?;
+                    b.free.whole(BLOCK).then_some((b.last_used_ms, idx))
+                })
+                .collect();
+            if empty_idx.len() > most {
+                // Keep the most recently used blocks warm up to `most`; trim aged tails.
+                empty_idx.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                for (used_ms, idx) in empty_idx.into_iter().skip(most) {
+                    let old_enough = min_idle_ms.is_none_or(|age| now.saturating_sub(used_ms) >= age);
+                    if old_enough && let Some(block) = self.blocks[idx].take() {
+                        evicted.push(block);
                     }
                 }
             }
         }
+        evicted
     }
 
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
+    }
+}
+
+/// Releases cold whole-free 64 MiB upload staging (and on pressure/panic, texture)
+/// blocks outside pool mutexes even when `VICTORY_RESIDENCY=1` is off.
+pub(crate) fn trim_idle_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    let mut staging_limit = policy.pool_staging_warm_blocks();
+    if crate::residency::on() {
+        if crate::residency::critical_commit() {
+            staging_limit = 0;
+        } else if crate::residency::pressured() {
+            staging_limit = staging_limit.min(1);
+        }
+    }
+    let min_age = (!policy.panic_memory).then_some(policy.pool_idle_ms);
+    let evicted_staging = if let Ok(mut pool) = STAGING.try_lock() {
+        pool.reclaim_with(now, staging_limit, min_age, true)
+    } else {
+        Vec::new()
+    };
+    let staging_bytes = (evicted_staging.len() as u64) * BLOCK;
+    drop(evicted_staging);
+    crate::ram_trim::note_pool_trimmed(staging_bytes);
+
+    let (tex_limit, clamp_spares) = if policy.panic_memory {
+        (Some(0), true)
+    } else if policy.aggressive && policy.low_memory {
+        (Some(SPARE), true)
+    } else if !crate::residency::on() {
+        (Some(SPARES.load(Ordering::Relaxed)), false)
+    } else {
+        (None, false)
+    };
+    if let Some(limit) = tex_limit {
+        if clamp_spares {
+            SPARES.fetch_min(limit, Ordering::Relaxed);
+        }
+        let evicted_tex = if let Ok(mut pool) = TEXTURES.try_lock() {
+            pool.reclaim_with(now, limit, min_age, true)
+        } else {
+            Vec::new()
+        };
+        drop(evicted_tex);
     }
 }
 
@@ -936,5 +1022,69 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn trim_idle_reclaims_aged_staging_blocks_outside_lock() {
+        let mut pool: Pool<u64> = Pool::new(8);
+        for (i, used_ms) in [1_000u64, 2_000, 12_000, 15_000, 18_000].into_iter().enumerate() {
+            pool.add_at(i as u64, 0, used_ms);
+        }
+        assert_eq!(pool.blocks(), 5);
+
+        // Keeps the 2 newest warm (`15_000`, `18_000`), spares the 12_000 block because its
+        // idle age (8s) is below the 10s threshold, and evicts the 2 oldest cold blocks.
+        let evicted = pool.reclaim_with(20_000, 2, Some(10_000), true);
+        assert_eq!(evicted.len(), 2);
+        let evicted_ids: Vec<u64> = evicted.iter().map(|b| b.memory).collect();
+        assert!(evicted_ids.contains(&0) && evicted_ids.contains(&1));
+        assert_eq!(pool.blocks(), 3);
+
+        // Once the middle block crosses the idle threshold, only the 2 warm blocks remain.
+        let evicted2 = pool.reclaim_with(25_000, 2, Some(10_000), true);
+        assert_eq!(evicted2.len(), 1);
+        assert_eq!(evicted2[0].memory, 2);
+        assert_eq!(pool.blocks(), 2);
+
+        // Panic mode drops the warm target to zero with no age gate.
+        let panic_policy = crate::ram_trim::TrimPolicy {
+            panic_memory: true,
+            ..crate::ram_trim::TrimPolicy::cached()
+        };
+        assert_eq!(panic_policy.pool_staging_warm_blocks(), 0);
+        let evicted3 = pool.reclaim_with(25_000, panic_policy.pool_staging_warm_blocks(), None, true);
+        assert_eq!(evicted3.len(), 2);
+        assert_eq!(pool.blocks(), 0);
+
+        // Smoke-check the global trim entry point does not panic or hold pool locks across drops.
+        let prev_spares = SPARES.load(Ordering::Relaxed);
+        trim_idle_with(&panic_policy, 25_000);
+        SPARES.store(prev_spares, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn trim_idle_clamps_spares_under_pressure_and_panic() {
+        let prev_spares = SPARES.load(Ordering::Relaxed);
+        SPARES.store(SPARE_KEPT, Ordering::Relaxed);
+
+        let low_mem_policy = crate::ram_trim::TrimPolicy {
+            aggressive: true,
+            low_memory: true,
+            panic_memory: false,
+            ..crate::ram_trim::TrimPolicy::cached()
+        };
+        trim_idle_with(&low_mem_policy, crate::host::now_ms());
+        assert_eq!(SPARES.load(Ordering::Relaxed), SPARE);
+        assert!(Ripe::now().ahead <= SPARE);
+
+        let panic_policy = crate::ram_trim::TrimPolicy {
+            panic_memory: true,
+            ..low_mem_policy
+        };
+        trim_idle_with(&panic_policy, crate::host::now_ms());
+        assert_eq!(SPARES.load(Ordering::Relaxed), 0);
+        assert_eq!(Ripe::now().ahead, 0);
+
+        SPARES.store(prev_spares, Ordering::Relaxed);
     }
 }

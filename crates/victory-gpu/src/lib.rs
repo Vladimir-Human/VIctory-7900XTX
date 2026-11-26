@@ -106,6 +106,8 @@ mod upload;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
+mod ram_trim;
+#[cfg(windows)]
 mod texback;
 
 #[cfg(windows)]

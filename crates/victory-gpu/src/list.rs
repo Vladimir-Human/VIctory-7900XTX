@@ -205,10 +205,14 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and when it was recycled (`host::now_ms`).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle {
+    host: crate::host::HostList,
+    scratch_bytes: u64,
+    recycled_ms: u64,
+}
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -249,13 +253,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
-            idle.1 -= bytes;
+        if let Some(Idle { scratch_bytes, .. }) = &taken {
+            idle.1 -= scratch_bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle { host, .. }) => Some(host),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -269,6 +273,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    let now = crate::host::now_ms();
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
@@ -282,10 +287,57 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+            idle.0.push(Idle { host, scratch_bytes: bytes, recycled_ms: now });
             idle.1 += bytes;
         }
     }
+}
+
+/// Releases cold idle host lists (whose command allocators can grow to gigabytes)
+/// and drops remaining idle lists' spare COM buffers outside all locks.
+#[cfg(windows)]
+pub(crate) fn let_go_idle_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    let warm_keep = if policy.panic_memory {
+        0
+    } else {
+        policy.list_idle_warm_count
+    };
+    let mut dropped: Vec<Idle> = Vec::new();
+    let mut trimmed_coms = crate::host::TrimmedListCaches::default();
+    let mut trimmed_scratch = 0u64;
+    {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let (list, bytes) = &mut *idle;
+        // `fresh_list` pops from the back (LIFO), so the front holds the oldest
+        // unused lists in order of `recycled_ms`.
+        let mut drain_n = 0usize;
+        while list.len() - drain_n > warm_keep {
+            let age = now.saturating_sub(list[drain_n].recycled_ms);
+            if age < policy.list_idle_ms && !policy.panic_memory {
+                break;
+            }
+            drain_n += 1;
+        }
+        if drain_n > 0 {
+            for item in list.drain(..drain_n) {
+                *bytes = bytes.saturating_sub(item.scratch_bytes);
+                trimmed_scratch += item.scratch_bytes;
+                dropped.push(item);
+            }
+        }
+        for entry in list.iter() {
+            if now.saturating_sub(entry.recycled_ms) >= policy.pool_idle_ms || policy.low_memory {
+                trimmed_scratch += entry.host.take_idle_caches(&mut trimmed_coms);
+            }
+        }
+    }
+    let count = dropped.len() as u64;
+    drop(trimmed_coms);
+    drop(dropped);
+    if count > 0 {
+        crate::ram_trim::note_lists_trimmed(count);
+    }
+    crate::ram_trim::note_pool_trimmed(trimmed_scratch);
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -2442,5 +2494,50 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[test]
+    fn idle_trim_releases_only_aged_lists_past_warm_count() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (Ok(h1), Ok(h2), Ok(h3)) = (host.new_list(), host.new_list(), host.new_list()) else {
+            return;
+        };
+        {
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            idle.0.clear();
+            idle.1 = 0;
+            idle.0.push(Idle { host: h1, scratch_bytes: 1024, recycled_ms: 1_000 });
+            idle.0.push(Idle { host: h2, scratch_bytes: 2048, recycled_ms: 2_000 });
+            idle.0.push(Idle { host: h3, scratch_bytes: 4096, recycled_ms: 19_000 });
+            idle.1 = 7168;
+        }
+        let policy = crate::ram_trim::TrimPolicy {
+            aggressive: true,
+            tier: crate::ram_trim::HostTier::Tight16,
+            low_memory: false,
+            panic_memory: false,
+            pool_idle_ms: 6_000,
+            shadow_pool_warm_bytes: 0,
+            shadow_pool_reserve_slots: 8,
+            scratch_spare_warm_bytes: 0,
+            texture_spare_warm_bytes: 0,
+            list_idle_warm_count: 1,
+            list_idle_ms: 10_000,
+            shader_dxil_idle_ms: 0,
+            shader_container_idle_ms: 0,
+            decommit_cold_reference_ms: None,
+            fetched_warm_bytes: 0,
+        };
+        let_go_idle_with(&policy, 20_000);
+        let remaining = {
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            let rem = (idle.0.len(), idle.1);
+            idle.0.clear();
+            idle.1 = 0;
+            rem
+        };
+        assert_eq!(remaining, (1, 4096), "only the 2 aged lists beyond warm count must drain");
     }
 }
