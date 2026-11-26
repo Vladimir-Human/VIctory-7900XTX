@@ -643,6 +643,17 @@ fn bury(finished: u64) {
     }
 }
 
+/// Drains all deferred retirements immediately for isolated unit tests when no
+/// GPU submission is in flight.
+#[cfg(test)]
+pub(crate) fn flush_retired_for_test() {
+    for part in &RETIRED {
+        let done: Vec<(u64, Retired)> =
+            part.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
+        drop(done);
+    }
+}
+
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
