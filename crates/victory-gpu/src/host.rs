@@ -562,6 +562,7 @@ fn sweep() {
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
+    crate::shadow::demote_under_pressure(host().and_then(|h| h.video_memory()));
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
 }
@@ -2170,6 +2171,42 @@ struct CardWork {
 unsafe impl Send for CardWork {}
 
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
+
+/// Narrow leaf mutex serializing direct calls to `Host::queue`
+/// (`ExecuteCommandLists`, `Signal`, `Wait`, `UpdateTileMappings`) across
+/// the submitting thread, relay thread, upq wait, upcheck, tiled mappings,
+/// and card-demotion readbacks. Never held across fence waits, `BUFFERS`,
+/// `DEMOTE_COPY`, `QUEUE_ORDER`, `Tiled::given`, or `Host::submitted`.
+pub(super) static QUEUE_SUBMIT: Mutex<()> = Mutex::new(());
+
+/// Acquires the narrow leaf mutex serializing direct calls to `Host::queue`.
+pub(crate) fn queue_lock() -> std::sync::MutexGuard<'static, ()> {
+    QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Stamps every `Shadow` touched by `runs` or `card` with the host fence value
+/// `fence` being signalled behind this submission, so card-buffer demotion
+/// never drops a buffer still in flight on the GPU.
+fn note_submitted_shadows(runs: &[&HostList], card: Option<&CardPlan>, fence: u64) {
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                Step::Refresh(shadow, _, _) | Step::GpuWrite(shadow, _, _) => {
+                    shadow.note_gpu_fence(fence);
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(plan) = card {
+        for shadow in &plan._synced {
+            shadow.note_gpu_fence(fence);
+        }
+        for r in &plan.ranges {
+            r.shadow.note_gpu_fence(fence);
+        }
+    }
+}
 
 /// The compare of a declared range of a copy in the card's memory with
 /// its bytes from before, one group per 64 KiB piece (cut at multiples of
@@ -3882,6 +3919,9 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod demote;
+#[cfg(test)]
+pub(crate) use demote::demote_readback_run;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 mod panel;
@@ -4346,16 +4386,16 @@ impl Host {
         Some(clock)
     }
 
-    /// Lists of ours just went to the queue: the clock's signal goes
-    /// behind them, and an idle stretch of the card, if one was under way,
-    /// ends here ([`CARD_CLOCK_US`]).
-    fn card_sent(&self) {
+    /// Lists of ours just went to the queue (caller holds [`QUEUE_SUBMIT`]):
+    /// the clock's signal goes behind them, and an idle stretch of the card,
+    /// if one was under way, ends here ([`CARD_CLOCK_US`]).
+    fn card_sent_locked(&self) {
         let Some(clock) = self.card_clock() else {
             return;
         };
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
         state.0 += 1;
-        // SAFETY: our queue and the clock's fence.
+        // SAFETY: our queue (serialized by `QUEUE_SUBMIT`) and the clock's fence.
         let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
         if let Some((since, worked_then)) = state.1.take() {
             CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -4363,6 +4403,21 @@ impl Host {
         }
         drop(state);
         clock.sent.notify_one();
+    }
+
+    /// The highest value completed on the host's main queue fence.
+    pub(crate) fn completed_fence(&self) -> u64 {
+        // SAFETY: a plain query on a live fence.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
+    /// Copies each `(src_vram_buffer, byte_len)` from card memory into a
+    /// transient CPU-visible staging buffer on `self.queue`, waits for a
+    /// dedicated fence, and returns the exact bytes of each buffer. Returns
+    /// `None` (and resets the internal `DemoteCopy` so it is never left
+    /// poisoned) if D3D12 copy or fence sync fails.
+    pub(crate) fn demote_readback(&self, srcs: &[(ID3D12Resource, u64)]) -> Option<Vec<Vec<u8>>> {
+        demote::demote_readback_host(self, srcs)
     }
 
     /// Whether the host has what copies in the card's memory need (three
@@ -4620,6 +4675,7 @@ impl Host {
                         }
                     }
                     list.Close()?;
+                    let _q = QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -4989,12 +5045,16 @@ impl Host {
                 }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
-                let after = *order;
-                drop(order);
-                self.card_sent();
-                self.queue.Signal(&fence, sent)?;
+                let after = {
+                    let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                    let _q = QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
+                    self.queue.ExecuteCommandLists(&lists);
+                    let after = *order;
+                    drop(order);
+                    self.card_sent_locked();
+                    self.queue.Signal(&fence, sent)?;
+                    after
+                };
                 meanwhile();
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
@@ -5284,10 +5344,13 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    self.card_sent();
-                    *submitted += 1;
-                    self.queue.Signal(&self.fence, *submitted)?;
+                    {
+                        let _q = QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
+                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                        self.card_sent_locked();
+                        *submitted += 1;
+                        self.queue.Signal(&self.fence, *submitted)?;
+                    }
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -5961,6 +6024,7 @@ impl Host {
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
+            note_submitted_shadows(runs, card.as_ref(), *submitted);
             #[cfg(feature = "diagnostics")]
             if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
@@ -5968,19 +6032,24 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
-                }
-                self.queue.Signal(&self.fence, *submitted)
+            // SAFETY: closed lists; the fence is ours; `QUEUE_SUBMIT`
+            // serializes queue operations against relay, upq, and demote readbacks.
+            let signalled = {
+                let _q = QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
+                let res = unsafe {
+                    let mut from = 0;
+                    for to in cuts.into_iter().chain([lists.len()]) {
+                        self.queue.ExecuteCommandLists(&lists[from..to]);
+                        from = to;
+                    }
+                    self.queue.Signal(&self.fence, *submitted)
+                };
+                self.card_sent_locked();
+                res
             };
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
-            self.card_sent();
             stage.next("submit: noting what is in the air");
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6026,16 +6095,21 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [(&lists[..], ())];
         submitting(2, runs.len());
-        for (_i, &(group, _kind)) in groups.iter().enumerate() {
+        for (i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
+            if i == 0 {
+                note_submitted_shadows(runs, card.as_ref(), *submitted + (groups.len() - 1) as u64);
+            }
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
-                self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
+                let signalled = {
+                    let _q = QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
+                    self.queue.ExecuteCommandLists(group);
+                    self.card_sent_locked();
+                    self.queue.Signal(&self.fence, *submitted)
+                };
+                let waited = signalled
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
@@ -6083,7 +6157,7 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = (_i, started);
+            let _ = (i, started);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -9539,13 +9613,19 @@ impl Meter {
                 );
                 if crate::shadow::cards() {
                     let per_frame = |i: usize| card[i] as f64 / frames;
+                    let tier = crate::shadow::card_tier_stats();
                     tracing::info!(
-                        "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
+                        "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; \
+                         card_demoted_count={} card_demoted_bytes={} ({} MB) card_reserved_large_rejects={}; per frame: \
                          {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
                          ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
                         card[7],
                         card[8] >> 20,
                         card[9] >> 20,
+                        tier.card_demoted_count,
+                        tier.card_demoted_bytes,
+                        tier.card_demoted_bytes >> 20,
+                        tier.card_reserved_large_rejects,
                         per_frame(0) / 1e6,
                         per_frame(1),
                         per_frame(2),
